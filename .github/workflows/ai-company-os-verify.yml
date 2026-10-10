@@ -1,49 +1,133 @@
-# Disposable verification workflow for AI Company OS "Phase A GitHub
-# Actions Verification Dispatch". This repository (phase-a-verify-
-# throwaway-20261010) exists only to exercise this workflow end-to-end
-# in isolation - it is unrelated to any real product, contains no real
-# application code, no secrets, and no real data, and is expected to
-# be deleted once this verification concludes.
+# Phase A GitHub Actions Verification Dispatch - verification workflow
+# template.
 #
-# This file's JOB BODY (name/on/permissions/jobs below) is copied
-# unchanged from the reviewed, tested source in the AI Company OS
-# repository (branch feature/phase-a-github-actions-verify-infra,
-# commit a673fbc433d7eac66e4343cce46366e70d956eb4) - only this header
-# comment differs, since the original's own header refers to that
-# repository's own branch/commit history, which is not meaningful here.
+# NOT ACTIVE: this file exists only as reviewed source on a local,
+# unpushed branch (feature/phase-a-github-actions-verify-infra). It has
+# never been pushed to GitHub, the governing GitHub App has not been
+# granted the permissions/webhook subscription below, and
+# GITHUB_WEBHOOK_SECRET is configured nowhere. Pushing this file,
+# changing GitHub App configuration, or triggering a real run all
+# require a separate, later, explicit Human Decision - the first real
+# target is an independent, private, throwaway GitHub repository, never
+# ai-company-os itself, TangoNavi, or the SEO/MEO SaaS repository.
 #
-# Trigger: repository_dispatch only (type "ai-company-os-verify").
-# This workflow never runs on push, schedule, or any other event - a
-# git push to this repository, including the push that adds this very
-# file, cannot and does not start a run. A run only starts when someone
-# explicitly calls POST /repos/{owner}/{repo}/dispatches with a
-# matching event_type, which requires an installation token from a
-# GitHub App with Contents:Write on this specific repository. No such
-# call is made by creating or pushing to this repository.
+# Required GitHub App configuration (documented here for that future
+# Human Decision, not applied by this file):
+#   - Repository permission "Contents": Write  (to call
+#     POST /repos/{owner}/{repo}/dispatches - confirmed against
+#     GitHub's own permissions-required-for-github-apps reference)
+#   - Repository permission "Actions": Read  (to call
+#     GET /repos/{owner}/{repo}/actions/runs/{run_id} - confirmed
+#     against the same reference. 2026-10-10 Step 5-G/5-H: this used
+#     to be a check_suite_id-filtered list call instead; see the SHA-
+#     proof note further below for why that was replaced)
+#   - Repository permission "Checks": Read  (the minimum level GitHub
+#     documents as required to SUBSCRIBE to check_run webhook
+#     deliveries at all; write-level Checks is only required for the
+#     rerequested/requested_action action types, neither of which this
+#     design uses - only action: "completed" is acted on)
+#   - Webhook subscription: check_run
+#   - This App does NOT need "Checks: Write" anywhere - it never calls
+#     the Checks API itself. Check runs are created/updated entirely by
+#     each JOB's own ephemeral, auto-expiring default GITHUB_TOKEN (see
+#     below) - never by this App's installation token, and this App's
+#     private key/installation token are never placed in this
+#     repository's own secrets.
 #
-# Required GitHub App configuration to actually dispatch/receive
-# results (not applied by this file - a separate, later step):
-#   - Repository permission "Contents": Write (to call the dispatches
-#     endpoint)
-#   - Repository permission "Actions": Read (to resolve run_id from
-#     check_suite_id)
-#   - Repository permission "Checks": Read (minimum level to subscribe
-#     to check_run webhook deliveries - this design never calls the
-#     Checks API with the App's own token; every check run is created/
-#     concluded using each job's own ephemeral, per-job default
-#     GITHUB_TOKEN instead, per the job-level privilege separation
-#     below)
-#   - Webhook subscription: check_run (only needed if webhook delivery,
-#     rather than REST API polling, is used to observe results)
+# 2026-10-10 "Phase A 最終セキュリティ確認" Human Decision (item 1):
+# this workflow was restructured from one job into THREE, specifically
+# for privilege separation AT THE JOB LEVEL, not merely the step level.
+# Each GitHub Actions job gets its own freshly-minted GITHUB_TOKEN,
+# scoped ONLY by that job's own `permissions:` block - this is a
+# stronger boundary than "don't reference the secret in this step's
+# env", because the `build` job's own token NEVER has checks:write at
+# all, regardless of what a compromised dependency running inside it
+# might try to read or exfiltrate.
 #
-# Job-level privilege separation: open-check and conclude-check each
-# get their own checks:write-scoped GITHUB_TOKEN; build gets contents:
-# read only and no checks permission at all, so nothing executed
-# during its install/lint/typecheck/build steps (even if fully
-# compromised) can call the Checks API. Every checkout step disables
-# credential persistence (persist-credentials: false) so no token is
-# left readable on disk for later steps. actions/checkout and pnpm/
-# action-setup are pinned to a verified release commit SHA.
+#   - open-check:    permissions: contents:read, checks:write.
+#                    Checks out the target commit, asserts the SHA,
+#                    and opens the verification Check Run. Runs no
+#                    install/build step at all - nothing from this
+#                    repository's own dependency tree executes in this
+#                    job.
+#   - build:         permissions: contents:read only (no checks at
+#                    all). Runs AFTER open-check. Checks out the SAME
+#                    target commit independently and re-asserts the
+#                    SHA (defense in depth), then runs install/lint/
+#                    typecheck/build. Even a fully compromised
+#                    dependency executing here cannot forge a Check
+#                    Run conclusion - this job's own token structurally
+#                    has no permission to call the Checks API at all,
+#                    not merely "the token isn't in this step's env".
+#   - conclude-check: permissions: contents:read, checks:write. Runs
+#                    AFTER both jobs (if: always()), does NOT check out
+#                    the repository at all (it needs no code - only
+#                    open-check's own check_run_id output and build's
+#                    own job result), and PATCHes the check run to
+#                    "completed" with a conclusion derived solely from
+#                    `needs.build.result`.
+#
+# Every checkout step below sets `persist-credentials: false`
+# (confirmed via actions/checkout's own README: the default, `true`,
+# persists the job's GITHUB_TOKEN to disk specifically "to run
+# authenticated git commands" for the REST of the job - meaning, by
+# design, any later code in that same job, compromised or not, could
+# read and use it. `false` prevents that persistence; steps that still
+# need the token get it only via their own explicit
+# `${{ secrets.GITHUB_TOKEN }}` expression, which is a workflow-compile
+# -time substitution into THAT step alone, never ambient to the
+# process environment of a step that does not reference it).
+#
+# Trust-chain purpose (mirrors src/lib/github/actionsRunCorrelation.ts's
+# own header - see that file for the full cross-check list, none of
+# which alone is treated as sufficient): the open-check job's own first
+# real step, immediately after checkout and before any of this
+# repository's own code can run anywhere in this workflow, asserts that
+# the commit actually checked out equals the target_commit_sha the
+# dispatch asked for, and only if that holds creates a GitHub Check Run
+# carrying head_sha=<that asserted commit>, external_id=<the dispatch's
+# own request_id>, a fixed known name, and output.summary embedding
+# this job's own GITHUB_RUN_ID. AI Company OS's webhook handler treats
+# that Check Run's signed, GitHub-delivered webhook event - cross-
+# checked against repository identity, an INDEPENDENT GET of that
+# exact github_run_id (never a check_suite_id-filtered search - see
+# the 2026-10-10 Step 5-G finding below), that run's own event/path/
+# head_sha, and run_attempt always re-read fresh from that same GET -
+# as the actual proof of which commit was verified and by which
+# workflow; never workflow_run.head_sha, never a run-name/`name`-field
+# match, never check_suite_id, and never any single one of those checks
+# alone.
+#
+# 2026-10-10 Step 5-G finding (empirically confirmed via a real second
+# dispatch against the same commit SHA, then fixed in Step 5-H):
+# GitHub's own Checks API documentation states a check suite is
+# normally reused across every check run GitHub Actions' own token
+# ("github-actions" app) creates for the same (App, commit SHA) pair.
+# That makes check_suite_id unable to distinguish which of several
+# Actions runs against the SAME commit actually produced a given check
+# run - confirmed to resolve to the WRONG (an earlier) run_id when this
+# commit was dispatched a second time. github_run_id/the open-check
+# step's own output.summary replaces that check_suite_id-based lookup
+# entirely, and is independently re-verified (never trusted on its own)
+# by the webhook handler via GET /actions/runs/{run_id} directly.
+#
+# Isolation / least privilege: no secret beyond each job's own
+# per-job-scoped GITHUB_TOKEN is referenced anywhere in this file. This
+# repository's own GitHub Secrets store must never contain AI Company
+# OS's Supabase service-role key, System Account credential, GitHub App
+# private key, or any AI provider API key - this workflow has no
+# legitimate use for any of them, and none should ever be added for
+# its sake.
+#
+# repository_dispatch's own documented behavior: GitHub always runs the
+# version of this file committed to this repository's DEFAULT branch,
+# regardless of client_payload content - this file cannot and does not
+# try to make itself run from some other ref.
+#
+# actions/checkout and pnpm/action-setup below are pinned to a verified
+# release commit SHA (resolved via a read-only GitHub API lookup
+# against each action's own public repository, not fabricated).
+
 name: AI Company OS Verification
 
 on:
@@ -78,13 +162,32 @@ jobs:
             echo "::error::checked-out SHA ($actual_sha) does not match requested target_commit_sha ($TARGET_COMMIT_SHA)"
             exit 1
           fi
+          # Embeds this job's own authoritative GITHUB_RUN_ID (set by
+          # GitHub itself, immutable across reruns - confirmed via
+          # GitHub's own Actions variables reference) into the check
+          # run's own output.summary field, as a small JSON string.
+          # This replaces the earlier check_suite_id-based run_id
+          # resolution design: GitHub's own Checks API documentation
+          # confirms a check suite is normally reused across every
+          # check run for the same (App, commit SHA) pair, so it
+          # cannot distinguish "this specific Actions run" when the
+          # same commit is dispatched more than once. github_run_id
+          # does not change across reruns, so no staleness risk exists
+          # even if a later rerun only re-executes some jobs -
+          # run_attempt itself is deliberately NOT embedded here; the
+          # webhook handler always re-reads it fresh via an
+          # independent GET of this exact run_id instead (see
+          # actionsRunCorrelation.ts), so a selective rerun of only
+          # `build`/`conclude-check` can never leave a stale attempt
+          # number behind.
+          output_summary="$(jq -nc --arg rid "$GITHUB_RUN_ID" '{github_run_id: $rid}')"
           http_status="$(curl -sS -o /tmp/check-run-create.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs" \
-            -d "$(jq -n --arg sha "$actual_sha" --arg ext "$REQUEST_ID" \
-              '{name:"ai-company-os-verify",head_sha:$sha,external_id:$ext,status:"in_progress"}')")"
+            -d "$(jq -n --arg sha "$actual_sha" --arg ext "$REQUEST_ID" --arg summary "$output_summary" \
+              '{name:"ai-company-os-verify",head_sha:$sha,external_id:$ext,status:"in_progress",output:{title:"ai-company-os-verify",summary:$summary}}')")"
           if [ "$http_status" != "201" ]; then
             echo "::error::failed to create verification check run (http_status=$http_status)"
             cat /tmp/check-run-create.json >&2
@@ -100,10 +203,12 @@ jobs:
   # Deliberately NO `checks` permission at all - this job's own
   # GITHUB_TOKEN cannot call the Checks API under any circumstance,
   # regardless of what code executes during install/lint/typecheck/
-  # build. In a real target repository these commands would be that
-  # repository's own actual verification commands; here they are
-  # intentionally trivial stubs (see package.json) since this
-  # repository's only purpose is to exercise the pipeline's wiring.
+  # build. Replace the commands below with this target repository's
+  # own real verification commands (matching its own
+  # project_verification_profiles row conceptually - this static file
+  # is not generated from that table, it is hand-configured per
+  # repository). Shown here using AI Company OS's own existing pnpm
+  # command set as the first, concrete rollout target.
   build:
     needs: [open-check]
     runs-on: ubuntu-latest
