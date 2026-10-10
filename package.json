@@ -1,0 +1,11 @@
+{
+  "name": "phase-a-verify-throwaway",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Disposable pipeline-wiring check for AI Company OS Phase A GitHub Actions Verification Dispatch. No real application code.",
+  "scripts": {
+    "lint": "echo ok",
+    "typecheck": "echo ok",
+    "build": "echo ok"
+  }
+}

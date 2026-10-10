@@ -1,0 +1,180 @@
+# Disposable verification workflow for AI Company OS "Phase A GitHub
+# Actions Verification Dispatch". This repository (phase-a-verify-
+# throwaway-20261010) exists only to exercise this workflow end-to-end
+# in isolation - it is unrelated to any real product, contains no real
+# application code, no secrets, and no real data, and is expected to
+# be deleted once this verification concludes.
+#
+# This file's JOB BODY (name/on/permissions/jobs below) is copied
+# unchanged from the reviewed, tested source in the AI Company OS
+# repository (branch feature/phase-a-github-actions-verify-infra,
+# commit a673fbc433d7eac66e4343cce46366e70d956eb4) - only this header
+# comment differs, since the original's own header refers to that
+# repository's own branch/commit history, which is not meaningful here.
+#
+# Trigger: repository_dispatch only (type "ai-company-os-verify").
+# This workflow never runs on push, schedule, or any other event - a
+# git push to this repository, including the push that adds this very
+# file, cannot and does not start a run. A run only starts when someone
+# explicitly calls POST /repos/{owner}/{repo}/dispatches with a
+# matching event_type, which requires an installation token from a
+# GitHub App with Contents:Write on this specific repository. No such
+# call is made by creating or pushing to this repository.
+#
+# Required GitHub App configuration to actually dispatch/receive
+# results (not applied by this file - a separate, later step):
+#   - Repository permission "Contents": Write (to call the dispatches
+#     endpoint)
+#   - Repository permission "Actions": Read (to resolve run_id from
+#     check_suite_id)
+#   - Repository permission "Checks": Read (minimum level to subscribe
+#     to check_run webhook deliveries - this design never calls the
+#     Checks API with the App's own token; every check run is created/
+#     concluded using each job's own ephemeral, per-job default
+#     GITHUB_TOKEN instead, per the job-level privilege separation
+#     below)
+#   - Webhook subscription: check_run (only needed if webhook delivery,
+#     rather than REST API polling, is used to observe results)
+#
+# Job-level privilege separation: open-check and conclude-check each
+# get their own checks:write-scoped GITHUB_TOKEN; build gets contents:
+# read only and no checks permission at all, so nothing executed
+# during its install/lint/typecheck/build steps (even if fully
+# compromised) can call the Checks API. Every checkout step disables
+# credential persistence (persist-credentials: false) so no token is
+# left readable on disk for later steps. actions/checkout and pnpm/
+# action-setup are pinned to a verified release commit SHA.
+name: AI Company OS Verification
+
+on:
+  repository_dispatch:
+    types: [ai-company-os-verify]
+
+jobs:
+  open-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    outputs:
+      check_run_id: ${{ steps.open.outputs.check_run_id }}
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.client_payload.target_commit_sha }}
+          persist-credentials: false
+
+      - name: Assert checked-out SHA and open verification check run
+        id: open
+        env:
+          TARGET_COMMIT_SHA: ${{ github.event.client_payload.target_commit_sha }}
+          REQUEST_ID: ${{ github.event.client_payload.request_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$TARGET_COMMIT_SHA" ]; then
+            echo "::error::checked-out SHA ($actual_sha) does not match requested target_commit_sha ($TARGET_COMMIT_SHA)"
+            exit 1
+          fi
+          http_status="$(curl -sS -o /tmp/check-run-create.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs" \
+            -d "$(jq -n --arg sha "$actual_sha" --arg ext "$REQUEST_ID" \
+              '{name:"ai-company-os-verify",head_sha:$sha,external_id:$ext,status:"in_progress"}')")"
+          if [ "$http_status" != "201" ]; then
+            echo "::error::failed to create verification check run (http_status=$http_status)"
+            cat /tmp/check-run-create.json >&2
+            exit 1
+          fi
+          check_run_id="$(jq -r '.id' /tmp/check-run-create.json)"
+          if [ -z "$check_run_id" ] || [ "$check_run_id" = "null" ]; then
+            echo "::error::verification check run response had no id"
+            exit 1
+          fi
+          echo "check_run_id=$check_run_id" >> "$GITHUB_OUTPUT"
+
+  # Deliberately NO `checks` permission at all - this job's own
+  # GITHUB_TOKEN cannot call the Checks API under any circumstance,
+  # regardless of what code executes during install/lint/typecheck/
+  # build. In a real target repository these commands would be that
+  # repository's own actual verification commands; here they are
+  # intentionally trivial stubs (see package.json) since this
+  # repository's only purpose is to exercise the pipeline's wiring.
+  build:
+    needs: [open-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.client_payload.target_commit_sha }}
+          persist-credentials: false
+
+      - name: Re-assert checked-out SHA (defense in depth)
+        env:
+          TARGET_COMMIT_SHA: ${{ github.event.client_payload.target_commit_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$TARGET_COMMIT_SHA" ]; then
+            echo "::error::checked-out SHA ($actual_sha) does not match requested target_commit_sha ($TARGET_COMMIT_SHA)"
+            exit 1
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+  conclude-check:
+    needs: [open-check, build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Conclude verification check run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECK_RUN_ID: ${{ needs.open-check.outputs.check_run_id }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CHECK_RUN_ID" ] || [ "$CHECK_RUN_ID" = "null" ]; then
+            echo "::error::no check_run_id was produced by open-check; nothing to conclude"
+            exit 1
+          fi
+          conclusion="failure"
+          if [ "$BUILD_RESULT" = "success" ]; then
+            conclusion="success"
+          fi
+          http_status="$(curl -sS -o /tmp/check-run-update.json -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/check-runs/${CHECK_RUN_ID}" \
+            -d "$(jq -n --arg concl "$conclusion" '{status:"completed",conclusion:$concl}')")"
+          if [ "$http_status" != "200" ]; then
+            echo "::error::failed to conclude verification check run (http_status=$http_status)"
+            cat /tmp/check-run-update.json >&2
+            exit 1
+          fi
